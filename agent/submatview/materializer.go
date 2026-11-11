@@ -5,6 +5,7 @@ package submatview
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -203,11 +204,12 @@ func (m *materializer) handleError(req *pbsubscribe.SubscribeRequest, err error)
 		logger = logger.With("key", req.Key) // nolint:staticcheck // SA1019 intentional use of deprecated field
 	}
 
-	if !notify {
+	var unavailable streamUnavailableErr
+	if !notify && errors.As(err, &unavailable) {
 		// No query saw this error, and the retry starts at once. When a
 		// server stops, every view with a stream on it comes here at the
 		// same time, so an Error line for each one floods the logs.
-		logger.Debug("subscribe call failed, retrying")
+		logger.Debug("subscribe stream ended by server, retrying")
 		return
 	}
 	logger.Error("subscribe call failed")
