@@ -427,6 +427,7 @@ func TestStore_IntegrationWithBackend_ServerStop(t *testing.T) {
 	conn, err := grpc.NewClient(rb.Scheme()+":///servers",
 		grpc.WithResolvers(rb),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultServiceConfig(subscribeRetryServiceConfig),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
@@ -500,13 +501,33 @@ func TestStore_IntegrationWithBackend_ServerStop(t *testing.T) {
 
 		select {
 		case r := <-ch:
+			// The error must come from the retry, which finds no server,
+			// not from the end of the stream.
 			require.Error(t, r.err)
+			require.Contains(t, r.err.Error(), "connection refused")
 			t.Logf("blocked query got the error after %s: %v", time.Since(start), r.err)
 		case <-time.After(4 * time.Second):
 			t.Fatal("blocked query did not get an error with no server up")
 		}
 	})
 }
+
+// subscribeRetryServiceConfig has the shape of the Subscribe retry policy of
+// grpc-internal.ClientConnPool, with short backoffs. In production, the backoffs
+// are 1s to 5s over 5 attempts, so with no server up, the retry after a stream
+// ends takes about 10 to 15 seconds before the error reaches the waiters.
+const subscribeRetryServiceConfig = `{
+	"methodConfig": [{
+		"name": [{"service": "subscribe.StateChangeSubscription", "method": "Subscribe"}],
+		"retryPolicy": {
+			"MaxAttempts": 5,
+			"BackoffMultiplier": 2,
+			"InitialBackoff": "0.05s",
+			"MaxBackoff": "0.2s",
+			"RetryableStatusCodes": ["UNAVAILABLE"]
+		}
+	}]
+}`
 
 func startStoppableServer(t *testing.T, pub *stream.EventPublisher) (*grpc.Server, net.Addr) {
 	srv := grpc.NewServer()

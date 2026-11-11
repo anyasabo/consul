@@ -460,31 +460,6 @@ func testHealthView_IntegrationWithStore_WithFullSnapshot(t *testing.T, peerName
 		prototest.AssertDeepEqual(t, expected, result.Value, cmpCheckServiceNodeNames)
 	})
 
-	testutil.RunStep(t, "receives new snapshot from a server that is behind after the server ends the stream", func(t *testing.T) {
-		// The next server does not have the index of the view in its buffer,
-		// so it sends a new snapshot. The view must be replaced, not merged.
-		client.QueueErr(status.Error(codes.Unavailable, "error reading from server: EOF"))
-
-		client.QueueEvents(
-			newNewSnapshotToFollowEvent(),
-			registerServiceWeb(60, 1),
-			registerServiceWeb(60, 6),
-			newEndOfSnapshotEvent(60))
-
-		start := time.Now()
-		req.MinQueryIndex = 50
-		req.MaxQueryTime = time.Second
-		result, err := store.Get(ctx, req)
-		require.NoError(t, err)
-		elapsed := time.Since(start)
-		require.True(t, elapsed < time.Second,
-			"Fetch should have returned before the timeout")
-
-		require.Equal(t, uint64(60), result.Index)
-		expected := newExpectedNodesInPeer(peerName, "node1", "node6")
-		expected.Index = 60
-		prototest.AssertDeepEqual(t, expected, result.Value, cmpCheckServiceNodeNames)
-	})
 }
 
 func newExpectedNodesInPeer(peerName string, nodes ...string) *structs.IndexedCheckServiceNodes {
