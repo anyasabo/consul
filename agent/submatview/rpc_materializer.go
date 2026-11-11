@@ -85,6 +85,11 @@ func (m *RPCMaterializer) subscribeOnce(ctx context.Context, req *pbsubscribe.Su
 		case isGrpcStatus(err, codes.Aborted):
 			m.mat.reset()
 			return resetErr("stream reset requested")
+		case isGrpcStatus(err, codes.Unavailable):
+			// The server went away, for example because it was stopped. Keep
+			// the view and resume from its index on another server, without
+			// returning an error to the blocked queries of this view.
+			return streamUnavailableErr{err: err}
 		case err != nil:
 			return err
 		}
@@ -115,6 +120,28 @@ func (e resetErr) Temporary() bool {
 // Error implements error
 func (e resetErr) Error() string {
 	return string(e)
+}
+
+// streamUnavailableErr is a stream that the server ended with
+// codes.Unavailable. It is typed so we can mark it as temporary and so attempt
+// to retry first time without notifying clients.
+type streamUnavailableErr struct {
+	err error
+}
+
+// Temporary Implements the internal Temporary interface
+func (e streamUnavailableErr) Temporary() bool {
+	return true
+}
+
+// Error implements error
+func (e streamUnavailableErr) Error() string {
+	return e.err.Error()
+}
+
+// Unwrap returns the gRPC status error.
+func (e streamUnavailableErr) Unwrap() error {
+	return e.err
 }
 
 // updateView implements viewState

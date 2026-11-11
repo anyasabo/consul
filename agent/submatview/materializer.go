@@ -182,7 +182,8 @@ func (m *materializer) updateView(events []*pbsubscribe.Event, index uint64) err
 
 func (m *materializer) handleError(req *pbsubscribe.SubscribeRequest, err error) {
 	failures := m.retryWaiter.Failures()
-	if isNonTemporaryOrConsecutiveFailure(err, failures) {
+	notify := isNonTemporaryOrConsecutiveFailure(err, failures)
+	if notify {
 		m.lock.Lock()
 		m.notifyUpdateLocked(err)
 		m.lock.Unlock()
@@ -202,6 +203,13 @@ func (m *materializer) handleError(req *pbsubscribe.SubscribeRequest, err error)
 		logger = logger.With("key", req.Key) // nolint:staticcheck // SA1019 intentional use of deprecated field
 	}
 
+	if !notify {
+		// No query saw this error, and the retry starts at once. When a
+		// server stops, every view with a stream on it comes here at the
+		// same time, so an Error line for each one floods the logs.
+		logger.Debug("subscribe call failed, retrying")
+		return
+	}
 	logger.Error("subscribe call failed")
 }
 
