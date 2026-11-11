@@ -223,6 +223,44 @@ func testHealthView_IntegrationWithStore_WithEmptySnapshot(t *testing.T, peerNam
 		req.MinQueryIndex = result.Index
 	})
 
+	testutil.RunStep(t, "reconnects and resumes after the server ends the stream", func(t *testing.T) {
+		// A stopped server ends every stream on it with this error.
+		streamClient.QueueErr(status.Error(codes.Unavailable, "error reading from server: EOF"))
+
+		// Next fetch will continue to block until timeout and receive the same
+		// result.
+		start := time.Now()
+		req.MaxQueryTime = 200 * time.Millisecond
+		result, err := store.Get(ctx, req)
+		require.NoError(t, err)
+		elapsed := time.Since(start)
+		require.True(t, elapsed >= 200*time.Millisecond,
+			"Fetch should have blocked until timeout")
+
+		require.Equal(t, req.MinQueryIndex, result.Index,
+			"result index should not have changed")
+		require.Equal(t, lastResultValue, result.Value.(*structs.IndexedCheckServiceNodes).Nodes,
+			"result value should not have changed")
+
+		// But an update should still be noticed due to reconnection
+		streamClient.QueueEvents(newEventServiceHealthRegister(12, 3, "web", peerName))
+
+		start = time.Now()
+		req.MaxQueryTime = time.Second
+		result, err = store.Get(ctx, req)
+		require.NoError(t, err)
+		elapsed = time.Since(start)
+		require.True(t, elapsed < time.Second,
+			"Fetch should have returned before the timeout")
+
+		require.Equal(t, uint64(12), result.Index)
+		lastResultValue = result.Value.(*structs.IndexedCheckServiceNodes).Nodes
+		require.Len(t, lastResultValue, 3,
+			"result value should contain the new registration")
+
+		req.MinQueryIndex = result.Index
+	})
+
 	testutil.RunStep(t, "returns non-temporary error to watchers", func(t *testing.T) {
 		// Wait and send the error while fetcher is waiting
 		go func() {
