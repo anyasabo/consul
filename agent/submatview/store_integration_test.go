@@ -21,6 +21,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/resolver"
+	"google.golang.org/grpc/resolver/manual"
 
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/cache"
@@ -388,4 +391,181 @@ func (s *snapshotHandler) Snapshot(req stream.SubscribeRequest, buf stream.Snaps
 		buf.Append([]stream.Event{event})
 	}
 	return idx, nil
+}
+
+// TestStore_IntegrationWithBackend_ServerStop stops the server of a stream
+// with a hard Stop, as consul.Server.Shutdown does. While another server is
+// up, a blocked query must not see an error, and it must get the next update.
+// When no server is up, the blocked query must get the error.
+func TestStore_IntegrationWithBackend_ServerStop(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sh := &staticSnapshotHandler{srvName: "srv1"}
+	pub := stream.NewEventPublisher(10 * time.Millisecond)
+	pub.RegisterHandler(pbsubscribe.Topic_ServiceHealth, sh.Snapshot, false)
+	go pub.Run(ctx)
+	sh.register(pub, 10, "node-a")
+
+	store := submatview.NewStore(hclog.New(nil))
+	go store.Run(ctx)
+
+	// Both servers share the publisher, like servers that share the raft log.
+	// pick_first uses the first address, so the stream goes to srvA.
+	srvA, addrA := startStoppableServer(t, pub)
+	srvB, addrB := startStoppableServer(t, pub)
+
+	rb := manual.NewBuilderWithScheme("stop-test")
+	rb.InitialState(resolver.State{Addresses: []resolver.Address{
+		{Addr: addrA.String()},
+		{Addr: addrB.String()},
+	}})
+	conn, err := grpc.NewClient(rb.Scheme()+":///servers",
+		grpc.WithResolvers(rb),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	client := &health.Client{
+		Client: rpcclient.Client{
+			UseStreamingBackend: true,
+			ViewStore:           store,
+			MaterializerDeps: rpcclient.MaterializerDeps{
+				Conn:   conn,
+				Logger: hclog.New(nil),
+			},
+			QueryOptionDefaults: func(*structs.QueryOptions) {},
+		},
+	}
+
+	req := structs.ServiceSpecificRequest{
+		ServiceName:  "srv1",
+		QueryOptions: structs.QueryOptions{UseCache: true, MaxQueryTime: 5 * time.Second},
+	}
+	out, meta, err := client.ServiceNodes(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, uint64(10), meta.Index)
+	require.Equal(t, []string{"node-a"}, nodeNames(out))
+
+	type result struct {
+		out  structs.IndexedCheckServiceNodes
+		meta cache.ResultMeta
+		err  error
+	}
+	blockingQuery := func(minIndex uint64) <-chan result {
+		ch := make(chan result, 1)
+		go func() {
+			r := req
+			r.MinQueryIndex = minIndex
+			out, meta, err := client.ServiceNodes(ctx, r)
+			ch <- result{out, meta, err}
+		}()
+		return ch
+	}
+
+	t.Run("stopped server, another server up", func(t *testing.T) {
+		ch := blockingQuery(10)
+		time.Sleep(200 * time.Millisecond)
+		srvA.Stop()
+
+		// Give the materializer time to see the stop and resubscribe before
+		// the next event, so the event comes over the new stream.
+		select {
+		case r := <-ch:
+			t.Fatalf("blocked query returned after the server stop: index=%d err=%v", r.meta.Index, r.err)
+		case <-time.After(time.Second):
+		}
+
+		sh.register(pub, 11, "node-b")
+		select {
+		case r := <-ch:
+			require.NoError(t, r.err)
+			require.Equal(t, uint64(11), r.meta.Index)
+			require.Equal(t, []string{"node-a", "node-b"}, nodeNames(r.out))
+		case <-time.After(4 * time.Second):
+			t.Fatal("blocked query did not get the update from the other server")
+		}
+	})
+
+	t.Run("no server up", func(t *testing.T) {
+		ch := blockingQuery(11)
+		time.Sleep(200 * time.Millisecond)
+		start := time.Now()
+		srvB.Stop()
+
+		select {
+		case r := <-ch:
+			require.Error(t, r.err)
+			t.Logf("blocked query got the error after %s: %v", time.Since(start), r.err)
+		case <-time.After(4 * time.Second):
+			t.Fatal("blocked query did not get an error with no server up")
+		}
+	})
+}
+
+func startStoppableServer(t *testing.T, pub *stream.EventPublisher) (*grpc.Server, net.Addr) {
+	srv := grpc.NewServer()
+	pbsubscribe.RegisterStateChangeSubscriptionServer(srv, &subscribe.Server{
+		Backend: backend{pub: pub},
+		Logger:  hclog.New(nil),
+	})
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+	return srv, lis.Addr()
+}
+
+func nodeNames(out structs.IndexedCheckServiceNodes) []string {
+	var names []string
+	for _, n := range out.Nodes {
+		names = append(names, n.Node.Node)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// staticSnapshotHandler holds the current nodes of one service, so that a
+// snapshot on any server returns the latest state.
+type staticSnapshotHandler struct {
+	srvName string
+	lock    sync.Mutex
+	index   uint64
+	nodes   []string
+}
+
+func (s *staticSnapshotHandler) register(pub *stream.EventPublisher, index uint64, node string) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.index = index
+	s.nodes = append(s.nodes, node)
+	pub.Publish([]stream.Event{s.event(index, node)})
+}
+
+func (s *staticSnapshotHandler) event(index uint64, node string) stream.Event {
+	return stream.Event{
+		Topic: pbsubscribe.Topic_ServiceHealth,
+		Index: index,
+		Payload: state.EventPayloadCheckServiceNode{
+			Op: pbsubscribe.CatalogOp_Register,
+			Value: &structs.CheckServiceNode{
+				Node:    &structs.Node{Node: node},
+				Service: &structs.NodeService{ID: s.srvName, Service: s.srvName},
+			},
+		},
+	}
+}
+
+func (s *staticSnapshotHandler) Snapshot(_ stream.SubscribeRequest, buf stream.SnapshotAppender) (uint64, error) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	for _, node := range s.nodes {
+		buf.Append([]stream.Event{s.event(s.index, node)})
+	}
+	return s.index, nil
 }
